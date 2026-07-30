@@ -137,6 +137,12 @@ router.put('/:id', authenticate, authorize('teacher'), async (req, res) => {
     }
 
     const updatedRoom = await updateRoom(req.params.id, req.body)
+
+    // Real-Time Sync: Emit updated room details to all connected students in the room
+    const io = req.app.get('io')
+    if (io) {
+      io.to(room.code).emit('room:updated', updatedRoom)
+    }
     
     // If room is being ended, emit socket event to notify all participants
     if (req.body.isActive === false && updatedRoom.endedAt) {

@@ -9,12 +9,6 @@ import ProfileDropdown from '../components/ProfileDropdown'
 import Leaderboard from '../components/Leaderboard'
 import { API_URL } from '../config.js'
 
-// Spread the ~N students' navigation to the results page over this window (ms). When a big room
-// ends, all students receive room:ended at once; without a spread they'd all hit the results
-// endpoints in the same instant (the end-session "results stampede"). Each student waits a random
-// delay in [0, this) before navigating. Scoring is unaffected — the session is already over.
-const RESULTS_NAV_JITTER_MS = 4000
-
 function StudentRoomPage() {
   const { roomCode } = useParams()
   const navigate = useNavigate()
@@ -34,9 +28,13 @@ function StudentRoomPage() {
   const [results, setResults] = useState(null)
   // Past responses loaded from MongoDB - no sessionStorage needed
   const [pastResponses, setPastResponses] = useState([])
-  const [sessionEnded, setSessionEnded] = useState(false) // room ended → show interstitial while we stagger navigation
+  const [sessionEnded, setSessionEnded] = useState(false) // room ended → show interstitial while we wait for the results page
+  const [pendingQuestionId, setPendingQuestionId] = useState(null)
+  // --- Academic Integrity States ---
+  const [isLockedInFullscreen, setIsLockedInFullscreen] = useState(false)
+  const [infractionPoints, setInfractionPoints] = useState(0) // Dynamic student infraction counter
+  const [isFullscreenUnsupported, setFullscreenUnsupported] = useState(false)
   const timerIntervalRef = useRef(null)
-  const resultsNavTimerRef = useRef(null)
 
   useEffect(() => {
     if (!token || !socket) return
@@ -58,18 +56,22 @@ function StudentRoomPage() {
       setCurrentQuestion(data)
       setSelectedOptions([])
       setSubmitted(false)
+      setInfractionPoints(0)
+      setHasAnsweredPoll(true)
       setTimeLeft(data.timer || 30)
-      
+
       if (data.question && data.question.timeToAnswer) {
         setTimeLeft(data.question.timeToAnswer)
       }
-      
+
+      // REDUNDANT LOCKOUT CHECK REMOVED TO PREVENT STALE CLOSURE FLICKERING [10]
+
       // Clear any existing timer
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current)
         timerIntervalRef.current = null
       }
-      
+
       timerIntervalRef.current = setInterval(() => {
         setTimeLeft(prev => {
           if (prev <= 1) {
@@ -79,6 +81,7 @@ function StudentRoomPage() {
             if (room?._id && user?._id) {
               fetchPastResponses(room._id, user._id)
             }
+            setPendingQuestionId(null)
             setCurrentQuestion(null)
             return 0
           }
@@ -98,6 +101,7 @@ function StudentRoomPage() {
       if (room?._id && user?._id) {
         fetchPastResponses(room._id, user._id)
       }
+      setPendingQuestionId(null)
       setResults(data?.results || null)
       setCurrentQuestion(null)
     }
@@ -109,12 +113,16 @@ function StudentRoomPage() {
         clearInterval(timerIntervalRef.current)
         timerIntervalRef.current = null
       }
-      
+
       setCurrentQuestion(question)
       setSelectedOptions([])
       setSubmitted(false)
+      setInfractionPoints(0)
+      setHasAnsweredPoll(true)
       setTimeLeft(question.timeToAnswer || 30)
-      
+
+      // REDUNDANT LOCKOUT CHECK REMOVED TO PREVENT STALE CLOSURE FLICKERING [10]
+
       timerIntervalRef.current = setInterval(() => {
         setTimeLeft(prev => {
           if (prev <= 1) {
@@ -124,6 +132,7 @@ function StudentRoomPage() {
             if (room?._id && user?._id) {
               fetchPastResponses(room._id, user._id)
             }
+            setPendingQuestionId(null)
             setCurrentQuestion(null)
             return 0
           }
@@ -141,18 +150,32 @@ function StudentRoomPage() {
       }
     }
 
+    // Real-Time Sync: Dynamically update local room settings when the teacher updates them [10]
+    const handleRoomUpdated = (updatedRoom) => {
+      console.log('Room settings updated via socket:', updatedRoom)
+      if (updatedRoom) {
+        setRoom(prev => {
+          if (prev && prev._id === updatedRoom._id) {
+            return { ...prev, ...updatedRoom }
+          }
+          return prev
+        })
+      }
+    }
+
     socket.on('question:started', handleQuestionStarted)
     socket.on('question:ended', handleQuestionEnded)
     socket.on('new_question', handleNewQuestion)
     socket.on('connect', handleReconnect)
+    socket.on('room:updated', handleRoomUpdated)
     socket.on('room:ended', () => {
-      // Show the interstitial immediately, but stagger the actual navigation across a jitter window
-      // so all students don't hit the results endpoints in the same instant.
       setSessionEnded(true)
-      const delay = Math.random() * RESULTS_NAV_JITTER_MS
-      resultsNavTimerRef.current = setTimeout(() => {
-        navigate(`/student/room/${room?._id}/results`)
-      }, delay)
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {})
+      }
+      setIsLockedInFullscreen(false)
+      setFullscreenUnsupported(false)
+      navigate(`/student/room/${room?._id}/results`)
     })
 
     return () => {
@@ -160,10 +183,30 @@ function StudentRoomPage() {
       socket.off('question:ended', handleQuestionEnded)
       socket.off('new_question', handleNewQuestion)
       socket.off('connect', handleReconnect)
+      socket.off('room:updated', handleRoomUpdated)
       socket.off('room:ended')
-      if (resultsNavTimerRef.current) clearTimeout(resultsNavTimerRef.current)
     }
   }, [socket, navigate, room?._id])
+
+  useEffect(() => {
+    const antiCheat = room?.settings?.enableAntiCheat || false
+
+    if (!antiCheat) {
+      setIsLockedInFullscreen(true)
+    } else {
+      const isCurrentlyFullscreen = !!document.fullscreenElement
+      // Persist Safe View Mode across questions once detected!
+      if (isCurrentlyFullscreen || isFullscreenUnsupported) {
+        setIsLockedInFullscreen(true)
+      } else {
+        setIsLockedInFullscreen(false)
+      }
+    }
+  }, [
+    room?.settings?.enableAntiCheat,
+    isFullscreenUnsupported,
+    currentQuestion?._id || currentQuestion
+  ])
 
   const joinSession = async () => {
     setIsLoading(true)
@@ -229,6 +272,69 @@ function StudentRoomPage() {
     }
   }
 
+  const sendTelemetry = async (eventType) => {
+    if (!room?._id || !currentQuestion) return
+    const qId = currentQuestion._id || currentQuestion.question?._id
+    if (!qId) return
+
+    try {
+      await fetch(`${API_URL}/responses/telemetry`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          roomId: room._id,
+          questionId: qId,
+          eventType
+        })
+      })
+    } catch (err) {
+      console.error('Failed to send telemetry:', err)
+    }
+  }
+
+  useEffect(() => {
+    const isAntiCheatEnabled = room?.settings?.enableAntiCheat || false
+    // Only monitor if anti-cheat is turned ON, a question is active, secure mode is locked, and they haven't submitted
+    if (!isAntiCheatEnabled || !currentQuestion || !isLockedInFullscreen || submitted) return
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        console.log('[TELEMETRY] Tab switch detected')
+        setInfractionPoints(prev => prev + 1.0) // Accumulate 1.0 locally
+        sendTelemetry('visibilitychange')
+      }
+    }
+
+    const handleBlur = () => {
+      console.log('[TELEMETRY] Focus lost (blur)')
+      setInfractionPoints(prev => prev + 0.10) // Accumulate 0.10 locally
+      sendTelemetry('blur')
+    }
+
+    const handleFullscreenChange = () => {
+      // Only track exits if they are NOT running in standard device fallback mode
+      if (!isFullscreenUnsupported && !document.fullscreenElement) {
+        console.log('[TELEMETRY] Fullscreen exit detected')
+        setInfractionPoints(prev => prev + 1.0) // Accumulate 1.0 locally
+        sendTelemetry('fullscreenchange')
+        setIsLockedInFullscreen(false) // Hide question and require re-entry
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('blur', handleBlur)
+    document.addEventListener('fullscreenchange', handleFullscreenChange)
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      window.removeEventListener('blur', handleBlur)
+      document.removeEventListener('fullscreenchange', handleFullscreenChange)
+    }
+  }, [currentQuestion, isLockedInFullscreen, submitted, room?._id, room?.settings?.enableAntiCheat, isFullscreenUnsupported])
+
   const handleSubmitAnswer = async () => {
     if (selectedOptions.length === 0 || submitted || !currentQuestion) return
 
@@ -244,6 +350,7 @@ function StudentRoomPage() {
     // even though the network POST itself is deferred by a small random delay.
     setSubmitted(true)
     setHasAnsweredPoll(true) // Prevent accidental leave after answering
+    setPendingQuestionId(questionId)
 
     // Client-side jitter: spread submissions across 0–2s so a synchronized classroom of 500+ does
     // not all hit POST /responses in the same instant. A simultaneous burst saturates the 2-core
@@ -290,14 +397,22 @@ function StudentRoomPage() {
     if (roomId && studentId) {
       fetchPastResponses(roomId, studentId)
     }
+
   }
 
   const leaveSession = () => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {})
+    }
+    setIsLockedInFullscreen(false)
+    setFullscreenUnsupported(false)
     if (room?.code) {
       leaveRoom(room.code, user._id)
     }
     navigate('/student')
   }
+
+  const isAntiCheatEnabled = room?.settings?.enableAntiCheat || false
 
   if (isLoading) {
     return (
@@ -450,7 +565,7 @@ function StudentRoomPage() {
             <button
               onClick={leaveSession}
               disabled={hasAnsweredPoll}
-              title={hasAnsweredPoll ? 'You cannot leave after answering a question' : 'Leave the session'}
+              title={hasAnsweredPoll ? 'You cannot leave after a poll has started' : 'Leave the session'}
               style={{
                 padding: '8px 16px',
                 background: hasAnsweredPoll ? 'var(--border-color)' : '#ef4444',
@@ -469,150 +584,250 @@ function StudentRoomPage() {
 
           {/* Live Question */}
           {currentQuestion ? (
-            <div style={{
-              background: 'linear-gradient(135deg, #7c3aed, #a855f7)',
-              borderRadius: '16px',
-              padding: '32px',
-              color: 'white',
-              boxShadow: '0 10px 40px rgba(124, 58, 237, 0.3)'
-            }}>
-              {/* Timer */}
-              <div style={{ textAlign: 'center', marginBottom: '24px' }}>
-                <div style={{
-                  width: '100px',
-                  height: '100px',
-                  borderRadius: '50%',
-                  border: '4px solid rgba(255,255,255,0.3)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  margin: '0 auto 16px'
-                }}>
-                  <span style={{ fontSize: '36px', fontWeight: '700' }}>{timeLeft}</span>
-                </div>
-                <p style={{ fontSize: '14px', opacity: 0.9 }}>seconds remaining</p>
-              </div>
-
-              {/* Question */}
-              <h2 style={{ fontSize: '24px', fontWeight: '700', textAlign: 'center', marginBottom: '32px' }}>
-                {currentQuestion.question}
-              </h2>
-
-              {/* Options */}
-              <div style={{ display: 'grid', gap: '12px', marginBottom: '24px' }}>
-                {currentQuestion.options && currentQuestion.options.map((option, index) => {
-                  const isMSQ = currentQuestion.type === 'MSQ'
-                  const isSelected = isMSQ 
-                    ? selectedOptions.includes(index)
-                    : selectedOptions.length === 1 && selectedOptions[0] === index
-                  const optionText = typeof option === 'string' ? option : option.text
-                  const optionLabel = String.fromCharCode(65 + index)
-                  
-                  const handleOptionClick = () => {
-                    if (submitted) return
-                    if (isMSQ) {
-                      // MSQ: Toggle selection
-                      setSelectedOptions(prev => 
-                        prev.includes(index) 
-                          ? prev.filter(i => i !== index)
-                          : [...prev, index]
-                      )
-                    } else {
-                      // MCQ/TF: Single selection
-                      setSelectedOptions([index])
+            isAntiCheatEnabled && !isLockedInFullscreen && !submitted ? (
+              <div style={{
+                background: 'linear-gradient(135deg, #1e3a8a, #3b82f6)',
+                borderRadius: '16px',
+                padding: '40px 32px',
+                color: 'white',
+                textAlign: 'center',
+                boxShadow: 'var(--card-shadow)'
+              }}>
+                <span style={{ fontSize: '48px', display: 'block', marginBottom: '16px' }}>🔒</span>
+                <h2 style={{ fontSize: '22px', fontWeight: '700', marginBottom: '12px' }}>Secure Quiz Mode Active</h2>
+                <p style={{ fontSize: '15px', opacity: 0.9, marginBottom: '24px', maxWidth: '400px', marginLeft: 'auto', marginRight: 'auto', lineHeight: '1.6' }}>
+                  To view and answer this question, you must enter secure fullscreen mode. Exiting fullscreen, switching tabs, or clicking out of focus will log violations.
+                </p>
+                <button
+                  onClick={async () => {
+                    try {
+                      const docEl = document.documentElement
+                      const requestMethod = docEl.requestFullscreen ||
+                                            docEl.webkitRequestFullscreen ||
+                                            docEl.mozRequestFullScreen ||
+                                            docEl.msRequestFullscreen
+                      
+                      if (requestMethod) {
+                        await requestMethod.call(docEl)
+                        setIsLockedInFullscreen(true)
+                        setFullscreenUnsupported(false)
+                      } else {
+                        throw new Error('Fullscreen API not supported on this browser')
+                      }
+                    } catch (err) {
+                      console.warn('Fullscreen request failed or unsupported:', err)
+                      setFullscreenUnsupported(true)
+                      setIsLockedInFullscreen(true)
+                      sendTelemetry('fullscreen_unsupported')
                     }
-                  }
-                  
-                  return (
-                    <button
-                      key={index}
-                      onClick={handleOptionClick}
-                      disabled={submitted}
-                      style={{
-                        padding: '20px 24px',
-                        background: submitted 
-                          ? 'rgba(255,255,255,0.1)'
-                          : (isSelected ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)'),
-                        border: `2px solid ${isSelected ? '#ffd700' : 'rgba(255,255,255,0.2)'}`,
-                        borderRadius: '12px',
-                        color: 'white',
-                        fontSize: '18px',
-                        textAlign: 'left',
-                        cursor: submitted ? 'default' : 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '16px'
-                      }}
-                    >
-                      {isMSQ && (
+                  }}
+                  style={{
+                    padding: '14px 28px',
+                    background: '#ffd700',
+                    color: '#1f2937',
+                    border: 'none',
+                    borderRadius: '10px',
+                    fontSize: '16px',
+                    fontWeight: '700',
+                    cursor: 'pointer',
+                    boxShadow: '0 4px 15px rgba(255, 215, 0, 0.4)'
+                  }}
+                >
+                  Start Question in Fullscreen
+                </button>
+              </div>
+            ) : (
+              <div
+                onCopy={(e) => { if (isAntiCheatEnabled) e.preventDefault() }}
+                onCut={(e) => { if (isAntiCheatEnabled) e.preventDefault() }}
+                onContextMenu={(e) => { if (isAntiCheatEnabled) e.preventDefault() }}
+                style={{
+                  background: 'linear-gradient(135deg, #7c3aed, #a855f7)',
+                  borderRadius: '16px',
+                  padding: '32px',
+                  color: 'white',
+                  boxShadow: '0 10px 40px rgba(124, 58, 237, 0.3)',
+                  userSelect: isAntiCheatEnabled ? 'none' : 'auto',
+                  WebkitUserSelect: isAntiCheatEnabled ? 'none' : 'auto',
+                  MozUserSelect: isAntiCheatEnabled ? 'none' : 'auto',
+                  msUserSelect: isAntiCheatEnabled ? 'none' : 'auto'
+                }}>
+                {/* Real-Time Proctor Warning Banner */}
+                {isAntiCheatEnabled && (infractionPoints > 0 || isFullscreenUnsupported) && !submitted && (
+                  <div style={{
+                    background: infractionPoints >= 7.0 ? 'rgba(239, 68, 68, 0.95)' : 
+                                infractionPoints >= 4.0 ? 'rgba(245, 158, 11, 0.95)' : 
+                                isFullscreenUnsupported ? 'rgba(59, 130, 246, 0.9)' :
+                                'rgba(255, 255, 255, 0.15)',
+                    border: '1px solid rgba(255, 255, 255, 0.3)',
+                    borderRadius: '12px',
+                    padding: '12px 16px',
+                    marginBottom: '20px',
+                    fontSize: '13px',
+                    color: 'white',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '4px',
+                    textAlign: 'left',
+                    boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+                  }}>
+                    <div style={{ fontWeight: '700', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span>{isFullscreenUnsupported ? '🔒 SAFE VIEW FALLBACK' : '⚠️ SECURITY ALERT'}</span>
+                      <span>Infraction Score: {infractionPoints.toFixed(2)} / 10.0</span>
+                    </div>
+                    <p style={{ margin: 0, opacity: 0.9, lineHeight: '1.4' }}>
+                      {isFullscreenUnsupported && infractionPoints === 0 ? (
+                        <span>Native fullscreen is unsupported on this device. Standard layout Safe View is active. Tab-switch and focus monitoring remain fully operational.</span>
+                      ) : infractionPoints >= 10.0 ? (
+                        <strong>CRITICAL: 100% score penalty will be applied to this question.</strong>
+                      ) : infractionPoints >= 7.0 ? (
+                        <strong>WARNING: Critical violations. 80% score penalty will be applied to this question.</strong>
+                      ) : infractionPoints >= 4.0 ? (
+                        <strong>WARNING: Moderate violations. 50% score penalty will be applied to this question.</strong>
+                      ) : (
+                        <span>Focus loss detected. Please maintain system focus to avoid penalties.</span>
+                      )}
+                    </p>
+                  </div>
+                )}
+                {/* Timer */}
+                <div style={{ textAlign: 'center', marginBottom: '24px' }}>
+                  <div style={{
+                    width: '100px',
+                    height: '100px',
+                    borderRadius: '50%',
+                    border: '4px solid rgba(255,255,255,0.3)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    margin: '0 auto 16px'
+                  }}>
+                    <span style={{ fontSize: '36px', fontWeight: '700' }}>{timeLeft}</span>
+                  </div>
+                  <p style={{ fontSize: '14px', opacity: 0.9 }}>seconds remaining</p>
+                </div>
+
+                {/* Question */}
+                <h2 style={{ fontSize: '24px', fontWeight: '700', textAlign: 'center', marginBottom: '32px' }}>
+                  {currentQuestion.question}
+                </h2>
+
+                {/* Options */}
+                <div style={{ display: 'grid', gap: '12px', marginBottom: '24px' }}>
+                  {currentQuestion.options && currentQuestion.options.map((option, index) => {
+                    const isMSQ = currentQuestion.type === 'MSQ'
+                    const isSelected = isMSQ 
+                      ? selectedOptions.includes(index)
+                      : selectedOptions.length === 1 && selectedOptions[0] === index
+                    const optionText = typeof option === 'string' ? option : option.text
+                    const optionLabel = String.fromCharCode(65 + index)
+                    
+                    const handleOptionClick = () => {
+                      if (submitted) return
+                      if (isMSQ) {
+                        // MSQ: Toggle selection
+                        setSelectedOptions(prev => 
+                          prev.includes(index) 
+                            ? prev.filter(i => i !== index)
+                            : [...prev, index]
+                        )
+                      } else {
+                        // MCQ/TF: Single selection
+                        setSelectedOptions([index])
+                      }
+                    }
+                    
+                    return (
+                      <button
+                        key={index}
+                        onClick={handleOptionClick}
+                        disabled={submitted}
+                        style={{
+                          padding: '20px 24px',
+                          background: submitted 
+                            ? 'rgba(255,255,255,0.1)'
+                            : (isSelected ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)'),
+                          border: `2px solid ${isSelected ? '#ffd700' : 'rgba(255,255,255,0.2)'}`,
+                          borderRadius: '12px',
+                          color: 'white',
+                          fontSize: '18px',
+                          textAlign: 'left',
+                          cursor: submitted ? 'default' : 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '16px'
+                        }}
+                      >
+                        {isMSQ && (
+                          <span style={{
+                            width: '24px',
+                            height: '24px',
+                            borderRadius: '6px',
+                            background: isSelected ? '#ffd700' : 'transparent',
+                            border: `2px solid ${isSelected ? '#ffd700' : 'rgba(255,255,255,0.4)'}`,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            color: isSelected ? '#1f2937' : 'white',
+                            fontSize: '14px'
+                          }}>
+                            {isSelected ? '✓' : ''}
+                          </span>
+                        )}
                         <span style={{
-                          width: '24px',
-                          height: '24px',
-                          borderRadius: '6px',
-                          background: isSelected ? '#ffd700' : 'transparent',
-                          border: `2px solid ${isSelected ? '#ffd700' : 'rgba(255,255,255,0.4)'}`,
+                          width: '36px',
+                          height: '36px',
+                          borderRadius: '50%',
+                          background: isSelected ? '#ffd700' : 'rgba(255,255,255,0.2)',
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
+                          fontWeight: '700',
                           color: isSelected ? '#1f2937' : 'white',
-                          fontSize: '14px'
+                          fontSize: '16px'
                         }}>
-                          {isSelected ? '✓' : ''}
+                          {optionLabel}
                         </span>
-                      )}
-                      <span style={{
-                        width: '36px',
-                        height: '36px',
-                        borderRadius: '50%',
-                        background: isSelected ? '#ffd700' : 'rgba(255,255,255,0.2)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontWeight: '700',
-                        color: isSelected ? '#1f2937' : 'white',
-                        fontSize: '16px'
-                      }}>
-                        {optionLabel}
-                      </span>
-                      <span>{optionText}</span>
-                    </button>
-                  )
-                })}
-              </div>
-
-              {/* Submit Button */}
-              {submitted ? (
-                <div style={{
-                  textAlign: 'center',
-                  padding: '20px',
-                  background: 'rgba(255,255,255,0.1)',
-                  borderRadius: '12px'
-                }}>
-                  <p style={{ fontSize: '18px', fontWeight: '600' }}>✓ Answer Submitted</p>
-                  <p style={{ fontSize: '14px', opacity: 0.9, marginTop: '8px' }}>
-                    Waiting for next question...
-                  </p>
+                        <span>{optionText}</span>
+                      </button>
+                    )
+                  })}
                 </div>
-              ) : (
-                <button
-                  onClick={handleSubmitAnswer}
-                  disabled={selectedOptions.length === 0}
-                  style={{
-                    width: '100%',
-                    padding: '16px',
-                    background: selectedOptions.length > 0 ? '#ffd700' : 'rgba(255,255,255,0.2)',
-                    color: selectedOptions.length > 0 ? '#1f2937' : 'rgba(255,255,255,0.5)',
-                    border: 'none',
-                    borderRadius: '12px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: selectedOptions.length > 0 ? 'pointer' : 'not-allowed'
-                  }}
-                >
-                  Submit Answer
-                </button>
-              )}
-            </div>
+
+                {/* Submit Button */}
+                {submitted ? (
+                  <div style={{
+                    textAlign: 'center',
+                    padding: '20px',
+                    background: 'rgba(255,255,255,0.1)',
+                    borderRadius: '12px'
+                  }}>
+                    <p style={{ fontSize: '18px', fontWeight: '600' }}>✓ Answer Submitted</p>
+                    <p style={{ fontSize: '14px', opacity: 0.9, marginTop: '8px' }}>
+                      Waiting for next question...
+                    </p>
+                  </div>
+                ) : (
+                  <button
+                    onClick={handleSubmitAnswer}
+                    disabled={selectedOptions.length === 0}
+                    style={{
+                      width: '100%',
+                      padding: '16px',
+                      background: selectedOptions.length > 0 ? '#ffd700' : 'rgba(255,255,255,0.2)',
+                      color: selectedOptions.length > 0 ? '#1f2937' : 'rgba(255,255,255,0.5)',
+                      border: 'none',
+                      borderRadius: '12px',
+                      fontSize: '16px',
+                      fontWeight: '600',
+                      cursor: selectedOptions.length > 0 ? 'pointer' : 'not-allowed'
+                    }}
+                  >
+                    Submit Answer
+                  </button>
+                )}
+              </div>
+            )
           ) : (
             /* Waiting State - Show Passed Questions */
             <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
@@ -659,7 +874,9 @@ function StudentRoomPage() {
                   </p>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                    {pastResponses.map((q, index) => (
+                    {pastResponses.map((q, index) => {
+                      const isPending = q._id === pendingQuestionId
+                      return (
                       <div key={`past-${index}`} style={{
                         padding: '20px',
                         background: 'var(--bg-primary)',
@@ -701,7 +918,7 @@ function StudentRoomPage() {
                               {q.answered ? (q.pointsEarned || 0) : 0}/{q.maxPoints || 100} pts
                             </span>
                           </div>
-                          {q.answered && q.isCorrect && (
+                          {q.answered && !isPending && q.isCorrect && (
                             <span style={{
                               padding: '4px 12px',
                               background: '#10b981',
@@ -713,7 +930,7 @@ function StudentRoomPage() {
                               ✓ Correct (+{q.pointsEarned || 0})
                             </span>
                           )}
-                          {q.answered && !q.isCorrect && (
+                          {q.answered && !isPending && !q.isCorrect && (
                             <span style={{
                               padding: '4px 12px',
                               background: '#ef4444',
@@ -725,6 +942,18 @@ function StudentRoomPage() {
                               ✗ Incorrect (+{q.pointsEarned || 0})
                             </span>
                           )}
+                          {isPending && (
+                            <span style={{
+                              padding: '4px 12px',
+                              background: '#f59e0b',
+                              color: 'white',
+                              borderRadius: '6px',
+                              fontSize: '12px',
+                              fontWeight: '600'
+                            }}>
+                              ⏳ Pending
+                            </span>
+                          )}
                         </div>
                         
                         {/* Question text */}
@@ -733,68 +962,99 @@ function StudentRoomPage() {
                         </p>
                         
                         {/* All options - always shown */}
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
-                          {(q.options || []).map((option, optIdx) => {
-                            const isSelected = q.selectedOptions?.includes(optIdx)
-                            const isCorrect = option.isCorrect
-                            const letter = String.fromCharCode(65 + optIdx)
+                        {isPending ? (
+                          <div style={{
+                            padding: '12px 16px',
+                            background: 'var(--bg-secondary)',
+                            borderRadius: '8px',
+                            fontSize: '13px',
+                            color: 'var(--text-secondary)',
+                            fontStyle: 'italic',
+                            marginBottom: '12px'
+                          }}>
+                            Results will show once the poll closes.
+                          </div>
+                        ) : (
+                          <>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
+                              {(q.options || []).map((option, optIdx) => {
+                                const isSelected = q.selectedOptions?.includes(optIdx)
+                                const isCorrect = option.isCorrect
+                                const letter = String.fromCharCode(65 + optIdx)
+                                
+                                let bgColor = 'var(--bg-secondary)'
+                                let borderColor = 'var(--border-color)'
+                                let textColor = 'var(--text-primary)'
+                                let label = ''
+                                
+                                if (q.answered && isSelected && isCorrect) {
+                                  bgColor = '#d1fae5'
+                                  borderColor = '#059669'
+                                  label = ' (Your correct answer)'
+                                } else if (q.answered && isSelected && !isCorrect) {
+                                  bgColor = '#fee2e2'
+                                  borderColor = '#dc2626'
+                                  label = ' (Your wrong answer)'
+                                } else if (!q.answered && isCorrect) {
+                                  bgColor = '#d1fae5'
+                                  borderColor = '#059669'
+                                  label = ' (Correct answer)'
+                                }
+                                
+                                return (
+                                  <div key={optIdx} style={{
+                                    padding: '12px 16px',
+                                    background: bgColor,
+                                    border: `2px solid ${borderColor}`,
+                                    borderRadius: '8px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '12px'
+                                  }}>
+                                    <span style={{
+                                      width: '28px',
+                                      height: '28px',
+                                      borderRadius: '50%',
+                                      background: isCorrect ? '#059669' : 'var(--border-color)',
+                                      color: 'white',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      fontWeight: '700',
+                                      fontSize: '14px',
+                                      flexShrink: 0
+                                    }}>
+                                      {letter}
+                                    </span>
+                                    <span style={{ fontSize: '14px', color: textColor, fontWeight: isCorrect ? '600' : '400' }}>
+                                      {option.text || option}
+                                    </span>
+                                    {label && (
+                                      <span style={{ fontSize: '12px', color: textColor, fontWeight: '600', marginLeft: 'auto' }}>
+                                        {label}
+                                      </span>
+                                    )}
+                                  </div>
+                                )
+                              })}
+                            </div>
                             
-                            let bgColor = 'var(--bg-secondary)'
-                            let borderColor = 'var(--border-color)'
-                            let textColor = 'var(--text-primary)'
-                            let label = ''
-                            
-                            if (q.answered && isSelected && isCorrect) {
-                              bgColor = '#d1fae5'
-                              borderColor = '#059669'
-                              label = ' (Your correct answer)'
-                            } else if (q.answered && isSelected && !isCorrect) {
-                              bgColor = '#fee2e2'
-                              borderColor = '#dc2626'
-                              label = ' (Your wrong answer)'
-                            } else if (!q.answered && isCorrect) {
-                              bgColor = '#d1fae5'
-                              borderColor = '#059669'
-                              label = ' (Correct answer)'
-                            }
-                            
-                            return (
-                              <div key={optIdx} style={{
-                                padding: '12px 16px',
-                                background: bgColor,
-                                border: `2px solid ${borderColor}`,
+                            {q.answered && !q.isCorrect && q.explanation && (
+                              <div style={{
+                                marginTop: '4px',
+                                marginBottom: '12px',
+                                padding: '12px 14px',
+                                background: 'var(--bg-card)',
+                                border: '1px solid var(--border-color)',
                                 borderRadius: '8px',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '12px'
+                                fontSize: '13px',
+                                color: 'var(--text-secondary)'
                               }}>
-                                <span style={{
-                                  width: '28px',
-                                  height: '28px',
-                                  borderRadius: '50%',
-                                  background: isCorrect ? '#059669' : 'var(--border-color)',
-                                  color: 'white',
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  justifyContent: 'center',
-                                  fontWeight: '700',
-                                  fontSize: '14px',
-                                  flexShrink: 0
-                                }}>
-                                  {letter}
-                                </span>
-                                <span style={{ fontSize: '14px', color: textColor, fontWeight: isCorrect ? '600' : '400' }}>
-                                  {option.text || option}
-                                </span>
-                                {label && (
-                                  <span style={{ fontSize: '12px', color: textColor, fontWeight: '600', marginLeft: 'auto' }}>
-                                    {label}
-                                  </span>
-                                )}
+                                <strong style={{ color: 'var(--text-primary)' }}>Why:</strong> {q.explanation}
                               </div>
-                            )
-                          })}
-                        </div>
+                            )}
+                          </>
+                        )}
                         
                         {/* Missed question notice */}
                         {!q.answered && (
@@ -803,7 +1063,7 @@ function StudentRoomPage() {
                           </p>
                         )}
                       </div>
-                    ))}
+                    )})}
                   </div>
                 )}
                 </div>

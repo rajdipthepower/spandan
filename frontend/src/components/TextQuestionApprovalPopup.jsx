@@ -394,6 +394,19 @@ function TextQuestionApprovalPopup({
               )
             })}
           </div>
+          {currentQuestion.explanation && (
+            <div style={{
+              marginTop: '16px',
+              padding: '12px',
+              borderRadius: '8px',
+              background: '#fef3c7',
+              border: '1px solid #fcd34d',
+              fontSize: '13px',
+              color: '#92400e'
+            }}>
+              <strong>Explanation:</strong> {currentQuestion.explanation}
+            </div>
+          )}
         </div>
         )}
 

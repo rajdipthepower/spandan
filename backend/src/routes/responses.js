@@ -2,10 +2,55 @@ import express from 'express'
 import { authenticate, authorize } from '../middleware/auth.js'
 import { isBatchEnabled, bufferResponse } from '../services/responseBuffer.js'
 import * as resultsSnapshot from '../services/resultsSnapshot.js'
+import Telemetry from '../models/Telemetry.js'
 const router = express.Router()
 
 // Apply authentication to all routes
 router.use(authenticate)
+
+// POST /api/responses/telemetry - Securely record focus loss, tab switch, and fullscreen exits
+router.post('/telemetry', authorize('student'), async (req, res) => {
+  try {
+    const { roomId, questionId, eventType } = req.body
+    const studentId = req.user._id
+
+    if (!roomId || !questionId || !eventType) {
+      return res.status(400).json({ error: 'Missing required fields' })
+    }
+
+    if (!['visibilitychange', 'fullscreenchange', 'blur', 'fullscreen_unsupported'].includes(eventType)) {
+      return res.status(400).json({ error: 'Invalid telemetry event type' })
+    }
+
+    const incField = eventType === 'visibilitychange' ? 'tabSwitches' :
+                     eventType === 'fullscreenchange' ? 'fullscreenExits' :
+                     eventType === 'blur' ? 'blurs' : null
+
+    if (incField) {
+      await Telemetry.findOneAndUpdate(
+        { roomId, questionId, studentId },
+        {
+          $inc: { [incField]: 1 },
+          $set: { updatedAt: new Date() }
+        },
+        { upsert: true, new: true }
+      )
+    } else if (eventType === 'fullscreen_unsupported') {
+      await Telemetry.findOneAndUpdate(
+        { roomId, questionId, studentId },
+        {
+          $set: { isFullscreenUnsupported: true, updatedAt: new Date() }
+        },
+        { upsert: true, new: true }
+      )
+    }
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error('Error recording telemetry:', error)
+    res.status(500).json({ success: false, error: 'Failed to record telemetry' })
+  }
+})
 
 // --- Hot-path read caches (Stage 2, Fix 4 + Fix 3a) --------------------------------------------
 // The POST /responses handler runs on every student answer; under a synchronized burst that is
@@ -115,6 +160,41 @@ router.post('/', authorize('student'), async (req, res) => {
     }
     // Incorrect answers get 0 points
 
+    // --- Start Academic Integrity Telemetry Penalty Engine ---
+    const telemetry = await Telemetry.findOne({ roomId, questionId, studentId }).lean()
+    
+    let tabSwitches = 0
+    let fullscreenExits = 0
+    let blurs = 0
+    let violationPoints = 0
+    let penaltyApplied = 0
+    let isFullscreenUnsupported = false
+    const originalPoints = points
+
+    if (telemetry) {
+      tabSwitches = telemetry.tabSwitches || 0
+      fullscreenExits = telemetry.fullscreenExits || 0
+      blurs = telemetry.blurs || 0
+      isFullscreenUnsupported = telemetry.isFullscreenUnsupported || false
+
+      // Tab Switch = 1.0, Fullscreen Exit = 1.0, Focus Loss (Blur) = 0.10 points
+      violationPoints = (tabSwitches * 1.0) + (fullscreenExits * 1.0) + (blurs * 0.10)
+
+      // Step-function tiered calculation
+      if (violationPoints >= 10.0) {
+        penaltyApplied = 100 // 100% penalty (0 points)
+      } else if (violationPoints >= 7.0) {
+        penaltyApplied = 80  // 80% penalty (keeps 20% points)
+      } else if (violationPoints >= 4.0) {
+        penaltyApplied = 50  // 50% penalty (keeps 50% points)
+      } else {
+        penaltyApplied = 0   // No penalty
+      }
+
+      points = Math.round(originalPoints * (1 - (penaltyApplied / 100)))
+    }
+    // --- End Penalty Engine ---
+
     const responseData = {
       roomId,
       questionId,
@@ -123,7 +203,16 @@ router.post('/', authorize('student'), async (req, res) => {
       selectedOptions, // Store all selections for MSQ
       isCorrect,
       responseTime: respTime,
-      points
+      points,
+      originalPoints,
+      violationPoints,
+      penaltyApplied,
+      isFullscreenUnsupported
+    }
+
+    // Right before the response is saved or buffered, clean up the telemetry document:
+    if (telemetry) {
+      await Telemetry.deleteOne({ _id: telemetry._id })
     }
 
     // Persist. DEFAULT path: save() immediately and let the unique index
@@ -517,6 +606,7 @@ router.get('/room/:roomId/student/:studentId', async (req, res) => {
         segmentIndex: q.segmentIndex,
         maxPoints: q.points,
         timeToAnswer: q.timeToAnswer,
+        explanation: q.explanation,
         answered: !!studentResponse,
         ...(studentResponse && {
           selectedOption: studentResponse.selectedOption,
