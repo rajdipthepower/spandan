@@ -367,14 +367,14 @@ function StudentRoomPage() {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
         console.log('[TELEMETRY] Tab switch detected')
-        setInfractionPoints(prev => prev + 1.0) // Accumulate 1.0 locally
+        setInfractionPoints(prev => Math.min(10.0, prev + 1.0)) // Cap at 10.0
         sendTelemetry('visibilitychange')
       }
     }
 
     const handleBlur = () => {
       console.log('[TELEMETRY] Focus lost (blur)')
-      setInfractionPoints(prev => prev + 0.4) // Accumulate 0.5 locally
+      setInfractionPoints(prev => Math.min(10.0, prev + 0.4)) // Cap at 10.0
       sendTelemetry('blur')
     }
 
@@ -382,7 +382,7 @@ function StudentRoomPage() {
       // Only track exits if they are NOT running in standard device fallback mode
       if (!isFullscreenUnsupported && !document.fullscreenElement) {
         console.log('[TELEMETRY] Fullscreen exit detected')
-        setInfractionPoints(prev => prev + 1.0) // Accumulate 1.0 locally
+        setInfractionPoints(prev => Math.min(10.0, prev + 1.0)) // Cap at 10.0
         sendTelemetry('fullscreenchange')
         setIsLockedInFullscreen(false) // Hide question and require re-entry
       }
@@ -757,7 +757,7 @@ function StudentRoomPage() {
                 {/* Real-Time Proctor Warning Banner */}
                 {isAntiCheatEnabled && (infractionPoints > 0 || isFullscreenUnsupported) && !submitted && (
                   <div style={{
-                      background: infractionPoints >= 8.0 ? 'rgba(239, 68, 68, 0.95)' :
+                      background: infractionPoints >= 10.0 ? 'rgba(239, 68, 68, 0.95)' :
                         infractionPoints >= 5.0 ? 'rgba(249, 115, 22, 0.95)' :
                           infractionPoints >= 2.0 ? 'rgba(234, 179, 8, 0.95)' :
                             isFullscreenUnsupported ? 'rgba(59, 130, 246, 0.9)' :
@@ -781,7 +781,7 @@ function StudentRoomPage() {
                     <p style={{ margin: 0, opacity: 0.9, lineHeight: '1.4' }}>
                       {isFullscreenUnsupported && infractionPoints === 0 ? (
                         <span>Native fullscreen is unsupported on this device. Standard layout Safe View is active. Tab-switch and focus monitoring remain fully operational.</span>
-                        ) : infractionPoints >= 8.0 ? (
+                        ) : infractionPoints >= 10.0 ? (
                           <strong>CRITICAL: 80% score penalty will be applied to this question.</strong>
                         ) : infractionPoints >= 5.0 ? (
                           <strong>WARNING: 50% score penalty will be applied to this question.</strong>

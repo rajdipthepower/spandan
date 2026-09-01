@@ -255,17 +255,18 @@ router.post('/', authorize('student'), async (req, res) => {
       isFullscreenUnsupported = telemetry.isFullscreenUnsupported || false
 
       // Tab Switch = 1.0, Fullscreen Exit = 1.0, Focus Loss (Blur) = 0.40 points
-      violationPoints = (tabSwitches * 1.0) + (fullscreenExits * 1.0) + (blurs * 0.4)
+      // Explicitly cap violationPoints at 10.0
+      violationPoints = Math.min(10.0, (tabSwitches * 1.0) + (fullscreenExits * 1.0) + (blurs * 0.4))
 
-      // Step-function tiered calculation
-      if (violationPoints >= 8.0) {
-        penaltyApplied = 80 // 80% penalty (keep 20% points)
+      // Step-function tiered calculation: 80% penalty triggered at 10.0
+      if (violationPoints >= 10.0) {
+        penaltyApplied = 80 // 80% penalty (keeps 20% points)
       } else if (violationPoints >= 5.0) {
-        penaltyApplied = 50  // 80% penalty (keeps 50% points)
+        penaltyApplied = 50 // 50% penalty (keeps 50% points)
       } else if (violationPoints >= 2.0) {
-        penaltyApplied = 20  // 20% penalty (keeps 80% points)
+        penaltyApplied = 20 // 20% penalty (keeps 80% points)
       } else {
-        penaltyApplied = 0   // No penalty
+        penaltyApplied = 0  // No penalty
       }
 
       points = Math.round(originalPoints * (1 - (penaltyApplied / 100)))
