@@ -254,16 +254,16 @@ router.post('/', authorize('student'), async (req, res) => {
       blurs = telemetry.blurs || 0
       isFullscreenUnsupported = telemetry.isFullscreenUnsupported || false
 
-      // Tab Switch = 1.0, Fullscreen Exit = 1.0, Focus Loss (Blur) = 0.10 points
-      violationPoints = (tabSwitches * 1.0) + (fullscreenExits * 1.0) + (blurs * 0.10)
+      // Tab Switch = 1.0, Fullscreen Exit = 1.0, Focus Loss (Blur) = 0.40 points
+      violationPoints = (tabSwitches * 1.0) + (fullscreenExits * 1.0) + (blurs * 0.4)
 
       // Step-function tiered calculation
-      if (violationPoints >= 10.0) {
-        penaltyApplied = 100 // 100% penalty (0 points)
-      } else if (violationPoints >= 7.0) {
-        penaltyApplied = 80  // 80% penalty (keeps 20% points)
-      } else if (violationPoints >= 4.0) {
-        penaltyApplied = 50  // 50% penalty (keeps 50% points)
+      if (violationPoints >= 8.0) {
+        penaltyApplied = 80 // 80% penalty (keep 20% points)
+      } else if (violationPoints >= 5.0) {
+        penaltyApplied = 50  // 80% penalty (keeps 50% points)
+      } else if (violationPoints >= 2.0) {
+        penaltyApplied = 20  // 20% penalty (keeps 80% points)
       } else {
         penaltyApplied = 0   // No penalty
       }

@@ -120,14 +120,6 @@ function StudentRoomPage() {
       timerIntervalRef.current = setInterval(() => {
         setTimeLeft(prev => {
           if (prev <= 1) {
-            clearInterval(timerIntervalRef.current)
-            timerIntervalRef.current = null
-            // Time expired - refresh from MongoDB only if room/user available
-            if (room?._id && user?._id) {
-              fetchPastResponses(room._id, user._id)
-            }
-            setPendingQuestionId(null)
-            setCurrentQuestion(null)
             return 0
           }
           return prev - 1
@@ -166,20 +158,10 @@ function StudentRoomPage() {
       setHasAnsweredPoll(true)
       setTimeLeft(question.timeToAnswer || 30)
 
-      // REDUNDANT LOCKOUT CHECK REMOVED TO PREVENT STALE CLOSURE FLICKERING [10]
-
       timerIntervalRef.current = setInterval(() => {
         setTimeLeft(prev => {
           if (prev <= 1) {
-            clearInterval(timerIntervalRef.current)
-            timerIntervalRef.current = null
-            // Time expired - refresh from MongoDB only if room/user available
-            if (room?._id && user?._id) {
-              fetchPastResponses(room._id, user._id)
-            }
-            setPendingQuestionId(null)
-            setCurrentQuestion(null)
-            return 0
+            return 0 // Pure update
           }
           return prev - 1
         })
@@ -253,6 +235,22 @@ function StudentRoomPage() {
       }
     }
   }, [socket, navigate, room?._id])
+
+  // Correctly placed at the root level of the functional component:
+  useEffect(() => {
+    if (timeLeft === 0 && currentQuestion) {
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current)
+        timerIntervalRef.current = null
+      }
+      // Time expired - refresh from MongoDB only if room/user available
+      if (room?._id && user?._id) {
+        fetchPastResponses(room._id, user._id)
+      }
+      setPendingQuestionId(null)
+      setCurrentQuestion(null)
+    }
+  }, [timeLeft, currentQuestion, room?._id, user?._id])
 
   useEffect(() => {
     const antiCheat = room?.settings?.enableAntiCheat || false
@@ -376,7 +374,7 @@ function StudentRoomPage() {
 
     const handleBlur = () => {
       console.log('[TELEMETRY] Focus lost (blur)')
-      setInfractionPoints(prev => prev + 0.10) // Accumulate 0.10 locally
+      setInfractionPoints(prev => prev + 0.4) // Accumulate 0.5 locally
       sendTelemetry('blur')
     }
 
@@ -649,7 +647,9 @@ function StudentRoomPage() {
               Hidden (not unmounted) while a question is live so the poll takes over like normal mode. */}
           {isVideoMode && videoId && (
             <div style={{
-              display: currentQuestion ? 'none' : 'block',
+              visibility: currentQuestion ? 'hidden' : 'visible',
+              position: currentQuestion ? 'absolute' : 'static',
+              pointerEvents: currentQuestion ? 'none' : 'auto',
               background: 'var(--bg-card)',
               borderRadius: 'var(--radius-lg)',
               padding: isMobile ? '12px' : '16px',
@@ -757,10 +757,11 @@ function StudentRoomPage() {
                 {/* Real-Time Proctor Warning Banner */}
                 {isAntiCheatEnabled && (infractionPoints > 0 || isFullscreenUnsupported) && !submitted && (
                   <div style={{
-                    background: infractionPoints >= 7.0 ? 'rgba(239, 68, 68, 0.95)' : 
-                                infractionPoints >= 4.0 ? 'rgba(245, 158, 11, 0.95)' : 
-                                isFullscreenUnsupported ? 'rgba(59, 130, 246, 0.9)' :
-                                'rgba(255, 255, 255, 0.15)',
+                      background: infractionPoints >= 8.0 ? 'rgba(239, 68, 68, 0.95)' :
+                        infractionPoints >= 5.0 ? 'rgba(249, 115, 22, 0.95)' :
+                          infractionPoints >= 2.0 ? 'rgba(234, 179, 8, 0.95)' :
+                            isFullscreenUnsupported ? 'rgba(59, 130, 246, 0.9)' :
+                              'rgba(255, 255, 255, 0.15)',
                     border: '1px solid rgba(255, 255, 255, 0.3)',
                     borderRadius: '12px',
                     padding: '12px 16px',
@@ -780,14 +781,14 @@ function StudentRoomPage() {
                     <p style={{ margin: 0, opacity: 0.9, lineHeight: '1.4' }}>
                       {isFullscreenUnsupported && infractionPoints === 0 ? (
                         <span>Native fullscreen is unsupported on this device. Standard layout Safe View is active. Tab-switch and focus monitoring remain fully operational.</span>
-                      ) : infractionPoints >= 10.0 ? (
-                        <strong>CRITICAL: 100% score penalty will be applied to this question.</strong>
-                      ) : infractionPoints >= 7.0 ? (
-                        <strong>WARNING: Critical violations. 80% score penalty will be applied to this question.</strong>
-                      ) : infractionPoints >= 4.0 ? (
-                        <strong>WARNING: Moderate violations. 50% score penalty will be applied to this question.</strong>
-                      ) : (
-                        <span>Focus loss detected. Please maintain system focus to avoid penalties.</span>
+                        ) : infractionPoints >= 8.0 ? (
+                          <strong>CRITICAL: 80% score penalty will be applied to this question.</strong>
+                        ) : infractionPoints >= 5.0 ? (
+                          <strong>WARNING: 50% score penalty will be applied to this question.</strong>
+                        ) : infractionPoints >= 2.0 ? (
+                          <strong>CAUTION: 20% score penalty will be applied to this question.</strong>
+                        ) : (
+                          <span>Focus loss detected. Please maintain system focus to avoid penalties.</span>
                       )}
                     </p>
                   </div>
