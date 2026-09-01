@@ -103,13 +103,10 @@ function StudentRoomPage() {
       setSubmitted(false)
       setInfractionPoints(0)
       setHasAnsweredPoll(true)
-      setTimeLeft(data.timer || 30)
 
-      if (data.question && data.question.timeToAnswer) {
-        setTimeLeft(data.question.timeToAnswer)
-      }
-
-      // REDUNDANT LOCKOUT CHECK REMOVED TO PREVENT STALE CLOSURE FLICKERING [10]
+      const tta = data.question?.timeToAnswer || data.timer || 30
+      const endTime = Date.now() + (tta * 1000)
+      setTimeLeft(tta)
 
       // Clear any existing timer
       if (timerIntervalRef.current) {
@@ -117,14 +114,15 @@ function StudentRoomPage() {
         timerIntervalRef.current = null
       }
 
+      // Wall-clock calculation prevents background tab sleep / interval lag
       timerIntervalRef.current = setInterval(() => {
-        setTimeLeft(prev => {
-          if (prev <= 1) {
-            return 0
-          }
-          return prev - 1
-        })
-      }, 1000)
+        const remaining = Math.max(0, Math.ceil((endTime - Date.now()) / 1000))
+        setTimeLeft(remaining)
+        if (remaining <= 0) {
+          clearInterval(timerIntervalRef.current)
+          timerIntervalRef.current = null
+        }
+      }, 250)
     }
 
     const handleQuestionEnded = (data) => {
@@ -144,28 +142,31 @@ function StudentRoomPage() {
     }
 
     const handleNewQuestion = (question) => {
-      // Handle manually created questions from teacher
+      setCurrentQuestion(question)
+      setSelectedOptions([])
+      setSubmitted(false)
+      setInfractionPoints(0)
+      setHasAnsweredPoll(true)
+
+      const tta = question.timeToAnswer || 30
+      const endTime = Date.now() + (tta * 1000)
+      setTimeLeft(tta)
+
       // Clear any existing timer
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current)
         timerIntervalRef.current = null
       }
 
-      setCurrentQuestion(question)
-      setSelectedOptions([])
-      setSubmitted(false)
-      setInfractionPoints(0)
-      setHasAnsweredPoll(true)
-      setTimeLeft(question.timeToAnswer || 30)
-
+      // Wall-clock calculation prevents background tab sleep / interval lag
       timerIntervalRef.current = setInterval(() => {
-        setTimeLeft(prev => {
-          if (prev <= 1) {
-            return 0 // Pure update
-          }
-          return prev - 1
-        })
-      }, 1000)
+        const remaining = Math.max(0, Math.ceil((endTime - Date.now()) / 1000))
+        setTimeLeft(remaining)
+        if (remaining <= 0) {
+          clearInterval(timerIntervalRef.current)
+          timerIntervalRef.current = null
+        }
+      }, 250)
     }
 
     // Self-heal after a socket reconnect: the store re-joins the room automatically, but a
