@@ -42,6 +42,7 @@ function StudentRoomPage() {
   const [pendingQuestionId, setPendingQuestionId] = useState(null)
   // --- Academic Integrity States ---
   const [isLockedInFullscreen, setIsLockedInFullscreen] = useState(false)
+  const [hasOpenedQuestion, setHasOpenedQuestion] = useState(false)
   const [infractionPoints, setInfractionPoints] = useState(0) // Dynamic student infraction counter
   const [isFullscreenUnsupported, setFullscreenUnsupported] = useState(false)
   const timerIntervalRef = useRef(null)
@@ -258,13 +259,16 @@ function StudentRoomPage() {
 
     if (!antiCheat) {
       setIsLockedInFullscreen(true)
+      setHasOpenedQuestion(true)
     } else {
       const isCurrentlyFullscreen = !!document.fullscreenElement
-      // Persist Safe View Mode across questions once detected!
+      // If already fullscreen or Safe View device, stay unlocked seamlessly
       if (isCurrentlyFullscreen || isFullscreenUnsupported) {
         setIsLockedInFullscreen(true)
+        setHasOpenedQuestion(true)
       } else {
         setIsLockedInFullscreen(false)
+        setHasOpenedQuestion(false)
       }
     }
   }, [
@@ -360,45 +364,56 @@ function StudentRoomPage() {
     }
   }
 
+  // Fullscreen and split-screen telemetry monitoring stays active after fullscreen exit once the
+  // student has opened the question.
   useEffect(() => {
     const isAntiCheatEnabled = room?.settings?.enableAntiCheat || false
-    // Only monitor if anti-cheat is turned ON, a question is active, secure mode is locked, and they haven't submitted
-    if (!isAntiCheatEnabled || !currentQuestion || !isLockedInFullscreen || submitted) return
+    if (!isAntiCheatEnabled || !currentQuestion || !hasOpenedQuestion || submitted) return
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
-        console.log('[TELEMETRY] Tab switch detected')
-        setInfractionPoints(prev => Math.min(10.0, prev + 1.0)) // Cap at 10.0
+        console.log('[TELEMETRY] Tab switch detected — 100% penalty applied')
+        setInfractionPoints(10.0) // Instant 10.0 points (100% penalty)
         sendTelemetry('visibilitychange')
       }
     }
 
-    const handleBlur = () => {
-      console.log('[TELEMETRY] Focus lost (blur)')
-      setInfractionPoints(prev => Math.min(10.0, prev + 0.4)) // Cap at 10.0
-      sendTelemetry('blur')
-    }
-
     const handleFullscreenChange = () => {
-      // Only track exits if they are NOT running in standard device fallback mode
       if (!isFullscreenUnsupported && !document.fullscreenElement) {
         console.log('[TELEMETRY] Fullscreen exit detected')
         setInfractionPoints(prev => Math.min(10.0, prev + 1.0)) // Cap at 10.0
         sendTelemetry('fullscreenchange')
-        setIsLockedInFullscreen(false) // Hide question and require re-entry
+        setIsLockedInFullscreen(false) // Drops user to the re-entry gate
+      }
+    }
+
+    const handleBlur = () => {
+      const screenWidth = window.screen?.availWidth || window.screen?.width || window.innerWidth
+      const windowWidth = window.outerWidth || window.innerWidth
+      if (!document.fullscreenElement && windowWidth < screenWidth * 0.6) {
+        console.log('[TELEMETRY] Split-screen blur detected — 100% max penalty applied')
+        setInfractionPoints(10.0) // Instant 10.0 points (100% penalty)
+        sendTelemetry('blur')
       }
     }
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
-    window.addEventListener('blur', handleBlur)
     document.addEventListener('fullscreenchange', handleFullscreenChange)
+    window.addEventListener('blur', handleBlur)
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange)
-      window.removeEventListener('blur', handleBlur)
       document.removeEventListener('fullscreenchange', handleFullscreenChange)
+      window.removeEventListener('blur', handleBlur)
     }
-  }, [currentQuestion, isLockedInFullscreen, submitted, room?._id, room?.settings?.enableAntiCheat, isFullscreenUnsupported])
+  }, [
+    currentQuestion,
+    hasOpenedQuestion,
+    submitted,
+    room?._id,
+    room?.settings?.enableAntiCheat,
+    isFullscreenUnsupported
+  ])
 
   const handleSubmitAnswer = async () => {
     if (selectedOptions.length === 0 || submitted || !currentQuestion) return
@@ -712,6 +727,7 @@ function StudentRoomPage() {
                         await requestMethod.call(docEl)
                         setIsLockedInFullscreen(true)
                         setFullscreenUnsupported(false)
+                        setHasOpenedQuestion(true) // Mark question as opened
                       } else {
                         throw new Error('Fullscreen API not supported on this browser')
                       }
@@ -719,6 +735,7 @@ function StudentRoomPage() {
                       console.warn('Fullscreen request failed or unsupported:', err)
                       setFullscreenUnsupported(true)
                       setIsLockedInFullscreen(true)
+                      setHasOpenedQuestion(true) // Mark question as opened in Safe View
                       sendTelemetry('fullscreen_unsupported')
                     }
                   }}
@@ -758,11 +775,11 @@ function StudentRoomPage() {
                 {/* Real-Time Proctor Warning Banner */}
                 {isAntiCheatEnabled && (infractionPoints > 0 || isFullscreenUnsupported) && !submitted && (
                   <div style={{
-                      background: infractionPoints >= 10.0 ? 'rgba(239, 68, 68, 0.95)' :
-                        infractionPoints >= 5.0 ? 'rgba(249, 115, 22, 0.95)' :
-                          infractionPoints >= 2.0 ? 'rgba(234, 179, 8, 0.95)' :
-                            isFullscreenUnsupported ? 'rgba(59, 130, 246, 0.9)' :
-                              'rgba(255, 255, 255, 0.15)',
+                    background: infractionPoints >= 10.0 ? 'rgba(239, 68, 68, 0.95)' :
+                                infractionPoints >= 5.0 ? 'rgba(249, 115, 22, 0.95)' :
+                                infractionPoints > 0 ? 'rgba(234, 179, 8, 0.95)' :
+                                isFullscreenUnsupported ? 'rgba(59, 130, 246, 0.9)' :
+                                'rgba(255, 255, 255, 0.15)',
                     border: '1px solid rgba(255, 255, 255, 0.3)',
                     borderRadius: '12px',
                     padding: '12px 16px',
@@ -776,20 +793,16 @@ function StudentRoomPage() {
                     boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
                   }}>
                     <div style={{ fontWeight: '700', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <span>{isFullscreenUnsupported ? '🔒 SAFE VIEW FALLBACK' : '⚠️ SECURITY ALERT'}</span>
-                      <span>Infraction Score: {infractionPoints.toFixed(2)} / 10.0</span>
+                      <span>{isFullscreenUnsupported && infractionPoints === 0 ? '🔒 SAFE VIEW FALLBACK' : '⚠️ SECURITY ALERT'}</span>
+                      <span>Infraction Score: {Math.round(infractionPoints)} / 10 ({Math.min(100, Math.round(infractionPoints * 10))}% Penalty)</span>
                     </div>
                     <p style={{ margin: 0, opacity: 0.9, lineHeight: '1.4' }}>
                       {isFullscreenUnsupported && infractionPoints === 0 ? (
-                        <span>Native fullscreen is unsupported on this device. Standard layout Safe View is active. Tab-switch and focus monitoring remain fully operational.</span>
-                        ) : infractionPoints >= 10.0 ? (
-                          <strong>CRITICAL: 80% score penalty will be applied to this question.</strong>
-                        ) : infractionPoints >= 5.0 ? (
-                          <strong>WARNING: 50% score penalty will be applied to this question.</strong>
-                        ) : infractionPoints >= 2.0 ? (
-                          <strong>CAUTION: 20% score penalty will be applied to this question.</strong>
-                        ) : (
-                          <span>Focus loss detected. Please maintain system focus to avoid penalties.</span>
+                        <span>Native fullscreen is unsupported on this device. Standard layout Safe View is active. Tab-switch monitoring remains fully operational.</span>
+                      ) : infractionPoints >= 10.0 ? (
+                        <strong>CRITICAL: 100% score penalty will be applied to this question (Tab Switch / Split Screen / Max Exits Detected).</strong>
+                      ) : (
+                        <strong>WARNING: {Math.round(infractionPoints * 10)}% score penalty will be applied to this question ({Math.round(infractionPoints)} fullscreen exit{Math.round(infractionPoints) === 1 ? '' : 's'}).</strong>
                       )}
                     </p>
                   </div>

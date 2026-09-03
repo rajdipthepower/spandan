@@ -16,7 +16,7 @@ const LEADERBOARD_TOP_N = Number(process.env.LEADERBOARD_TOP_N) || 10
 // Apply authentication to all routes
 router.use(authenticate)
 
-// POST /api/responses/telemetry - Securely record focus loss, tab switch, and fullscreen exits
+// POST /api/responses/telemetry - Securely record tab switch and fullscreen exits
 router.post('/telemetry', authorize('student'), async (req, res) => {
   try {
     const { roomId, questionId, eventType } = req.body
@@ -26,7 +26,7 @@ router.post('/telemetry', authorize('student'), async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' })
     }
 
-    if (!['visibilitychange', 'fullscreenchange', 'blur', 'fullscreen_unsupported'].includes(eventType)) {
+    if (!['visibilitychange', 'fullscreenchange', 'fullscreen_unsupported', 'blur'].includes(eventType)) {
       return res.status(400).json({ error: 'Invalid telemetry event type' })
     }
 
@@ -254,20 +254,16 @@ router.post('/', authorize('student'), async (req, res) => {
       blurs = telemetry.blurs || 0
       isFullscreenUnsupported = telemetry.isFullscreenUnsupported || false
 
-      // Tab Switch = 1.0, Fullscreen Exit = 1.0, Focus Loss (Blur) = 0.40 points
-      // Explicitly cap violationPoints at 10.0
-      violationPoints = Math.min(10.0, (tabSwitches * 1.0) + (fullscreenExits * 1.0) + (blurs * 0.4))
-
-      // Step-function tiered calculation: 80% penalty triggered at 10.0
-      if (violationPoints >= 10.0) {
-        penaltyApplied = 80 // 80% penalty (keeps 20% points)
-      } else if (violationPoints >= 5.0) {
-        penaltyApplied = 50 // 50% penalty (keeps 50% points)
-      } else if (violationPoints >= 2.0) {
-        penaltyApplied = 20 // 20% penalty (keeps 80% points)
+      // Tab switch or split-screen blur triggers instant 10 violation points (100% max penalty)
+      // Fullscreen exit adds 1 violation point each, capped at 10
+      if (tabSwitches > 0 || blurs > 0) {
+        violationPoints = 10
       } else {
-        penaltyApplied = 0  // No penalty
+        violationPoints = Math.min(10, fullscreenExits * 1)
       }
+
+      // Linear 1:1 mapping: 1 point = 10% penalty, 10 points = 100% penalty
+      penaltyApplied = Math.min(100, Math.round(violationPoints * 10))
 
       points = Math.round(originalPoints * (1 - (penaltyApplied / 100)))
     }
